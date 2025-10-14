@@ -1,8 +1,6 @@
-
 import io
-import math
-import json
-from datetime import datetime, timedelta, date
+import os
+from datetime import timedelta, date
 from typing import Dict, Tuple, List
 
 import numpy as np
@@ -15,7 +13,6 @@ from sklearn.preprocessing import StandardScaler, FunctionTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
-
 import streamlit as st
 
 # ------------------------------
@@ -27,8 +24,18 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# =============================================================================
+# Data Ingress Options (priority order)
+# 1) Sidebar GitHub/HTTP URL (raw .xlsx or .csv)
+# 2) Local file in repo: ecommerce_clickstream_transactions.xlsx
+# 3) Streamlit uploader (.xlsx or .csv)
+# =============================================================================
+
+DEFAULT_LOCAL_XLSX = "ecommerce_clickstream_transactions.xlsx"
+DEFAULT_SHEET = "ecommerce_clickstream_transacti"  # per spec (auto-detect if different)
+
 # ------------------------------
-# Utility: Safe Popover/Modal Fallback
+# Definitions quick reference
 # ------------------------------
 def definitions_ui():
     content = '''
@@ -55,8 +62,10 @@ def definitions_ui():
         with st.sidebar.expander("Definitions & Formulas", expanded=False):
             st.markdown(content)
 
+definitions_ui()
+
 # ------------------------------
-# Column Matching
+# Robust column matching
 # ------------------------------
 COL_RULES = {
     "timestamp": ["timestamp", "time", "date", "datetime"],
@@ -68,19 +77,14 @@ COL_RULES = {
 }
 
 def find_col(df: pd.DataFrame, keys: List[str]) -> str:
-    cols = list(df.columns)
     for token in keys:
-        for c in cols:
+        for c in df.columns:
             if token in c.lower():
                 return c
     return ""
 
 def auto_map_columns(df: pd.DataFrame) -> Dict[str, str]:
-    mapping = {}
-    for logical, tokens in COL_RULES.items():
-        col = find_col(df, tokens)
-        mapping[logical] = col
-    return mapping
+    return {logical: find_col(df, tokens) for logical, tokens in COL_RULES.items()}
 
 def column_mapping_helper(df: pd.DataFrame, mapping: Dict[str, str]) -> Dict[str, str]:
     st.info("If auto-detection is incorrect, adjust the mappings below and click **Apply**.")
@@ -93,7 +97,7 @@ def column_mapping_helper(df: pd.DataFrame, mapping: Dict[str, str]) -> Dict[str
     return new_map
 
 # ------------------------------
-# Event Normalization
+# Event normalization
 # ------------------------------
 def normalize_event(s: pd.Series) -> pd.Series:
     s = s.astype(str).str.lower().fillna("")
@@ -105,19 +109,37 @@ def normalize_event(s: pd.Series) -> pd.Series:
     return pd.Series(out, index=s.index).astype(str)
 
 # ------------------------------
-# Load Excel (cached)
+# IO helpers (cached)
 # ------------------------------
 @st.cache_data(show_spinner=True)
-def load_excel(file_bytes: bytes, sheet_name: str | None) -> pd.DataFrame:
+def _read_excel_bytes(file_bytes: bytes, sheet: str | None) -> pd.DataFrame:
+    # Require openpyxl for .xlsx
+    try:
+        import openpyxl  # noqa: F401  # ensure dependency is present
+    except Exception as e:
+        raise ImportError(
+            "Reading .xlsx requires 'openpyxl'. "
+            "Install it with: pip install openpyxl"
+        ) from e
     bio = io.BytesIO(file_bytes)
-    if sheet_name:
-        df = pd.read_excel(bio, sheet_name=sheet_name)
-    else:
-        df = pd.read_excel(bio)
-    return df
+    # If sheet specified, use it; else let pandas default to first sheet
+    if sheet:
+        return pd.read_excel(bio, sheet_name=sheet)
+    return pd.read_excel(bio)
+
+@st.cache_data(show_spinner=True)
+def _read_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(file_bytes))
+
+@st.cache_data(show_spinner=True)
+def _http_get(url: str) -> bytes:
+    # Minimal stdlib HTTP getter (no extra deps)
+    import urllib.request
+    with urllib.request.urlopen(url) as resp:
+        return resp.read()
 
 # ------------------------------
-# Heavy Transform (cached)
+# Preprocess (cached)
 # ------------------------------
 @st.cache_data(show_spinner=True)
 def preprocess(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[pd.DataFrame, Dict[str, str], pd.Timestamp, pd.Timestamp]:
@@ -125,47 +147,55 @@ def preprocess(df: pd.DataFrame, mapping: Dict[str, str]) -> Tuple[pd.DataFrame,
     missing = [r for r in required if not mapping.get(r)]
     if missing:
         raise ValueError(f"Missing mapped columns for: {', '.join(missing)}")
-    canon = {k: mapping[k] for k in ["timestamp", "user", "session", "event", "product", "amount"]}
-    df = df.rename(columns={v: k for k, v in canon.items() if v})
+
+    rename_map = {mapping[k]: k for k in required if mapping.get(k)}
+    df = df.rename(columns=rename_map)
+
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=False)
     df = df.dropna(subset=["timestamp"])
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
     df["event_norm"] = normalize_event(df["event"])
+
     min_dt = pd.to_datetime(df["timestamp"].min()).normalize()
     max_dt = pd.to_datetime(df["timestamp"].max()).normalize()
+
     df["date"] = df["timestamp"].dt.date
     df["hour"] = df["timestamp"].dt.hour
+
     return df, {"canonical": list(df.columns)}, pd.Timestamp(min_dt), pd.Timestamp(max_dt)
 
 def filter_by_date(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-    mask = (df["timestamp"].dt.date >= start) & (df["timestamp"].dt.date <= end)
-    return df.loc[mask].copy()
+    return df.loc[(df["timestamp"].dt.date >= start) & (df["timestamp"].dt.date <= end)].copy()
 
 def purchase_df(df: pd.DataFrame) -> pd.DataFrame:
     return df[(df["event_norm"] == "purchase") & (df["amount"].notna()) & (df["amount"] >= 0)]
 
 # ------------------------------
-# KPI Computations
+# KPIs
 # ------------------------------
 def compute_kpis(df: pd.DataFrame, start: date, end: date, full_df: pd.DataFrame) -> Dict[str, float]:
     dff = filter_by_date(df, start, end)
     purch = purchase_df(dff)
+
     total_rev = float(purch["amount"].sum()) if not purch.empty else 0.0
     aov = float(purch["amount"].mean()) if not purch.empty else 0.0
+
     ses_total = dff["session"].nunique()
     ses_with_purchase = dff.loc[dff["event_norm"] == "purchase", "session"].nunique()
     conversion = (ses_with_purchase / ses_total) if ses_total > 0 else 0.0
+
     users_with_1p = dff.loc[dff["event_norm"] == "purchase", "user"].nunique()
     users_with_2p = dff.loc[dff["event_norm"] == "purchase"].groupby("user").size()
     users_with_2p = int((users_with_2p >= 2).sum())
     repeat_rate = (users_with_2p / users_with_1p) if users_with_1p > 0 else 0.0
+
     end_dt = pd.to_datetime(end)
-    win7_start = (end_dt - timedelta(days=6)).date()
-    win30_start = (end_dt - timedelta(days=29)).date()
-    au7 = filter_by_date(dff, max(start, win7_start), end)["user"].nunique()
-    au30 = filter_by_date(dff, max(start, win30_start), end)["user"].nunique()
+    au7 = filter_by_date(dff, max(start, (end_dt - timedelta(days=6)).date()), end)["user"].nunique()
+    au30 = filter_by_date(dff, max(start, (end_dt - timedelta(days=29)).date()), end)["user"].nunique()
+
     users_active = dff["user"].nunique()
     arpu = (total_rev / users_active) if users_active > 0 else 0.0
+
     def delta_over(days: int) -> float | None:
         prev_start = (pd.to_datetime(start) - timedelta(days=days)).date()
         prev_end = (pd.to_datetime(end) - timedelta(days=days)).date()
@@ -177,8 +207,10 @@ def compute_kpis(df: pd.DataFrame, start: date, end: date, full_df: pd.DataFrame
         if prev_rev == 0:
             return None
         return (total_rev - prev_rev) / prev_rev
+
     d30 = delta_over(30)
     d90 = delta_over(90)
+
     try:
         prev_start_y = (pd.to_datetime(start) - relativedelta(years=1)).date()
         prev_end_y = (pd.to_datetime(end) - relativedelta(years=1)).date()
@@ -191,6 +223,7 @@ def compute_kpis(df: pd.DataFrame, start: date, end: date, full_df: pd.DataFrame
                 yoy = (total_rev - prev_y_rev) / prev_y_rev
     except Exception:
         yoy = None
+
     return {
         "total_revenue": total_rev,
         "aov": aov,
@@ -205,7 +238,7 @@ def compute_kpis(df: pd.DataFrame, start: date, end: date, full_df: pd.DataFrame
     }
 
 # ------------------------------
-# Charts Helpers
+# Charts
 # ------------------------------
 def daily_revenue_chart(df: pd.DataFrame, start: date, end: date):
     dff = filter_by_date(df, start, end)
@@ -258,7 +291,7 @@ def horizontal_funnel(df: pd.DataFrame):
     counts = []
     for i, s in enumerate(order):
         if i == 0:
-            n = int((df[f"has_{s}"]).sum())
+            n = int(df[f"has_{s}"].sum())
         else:
             prev = order[i-1]
             n = int(((df[f"has_{prev}"]) & (df[f"has_{s}"])).sum())
@@ -289,8 +322,7 @@ def median_time_between(df_events: pd.DataFrame, start: date, end: date):
     if medians:
         dfm = pd.DataFrame({"stage_pair": list(medians.keys()), "median_minutes": list(medians.values())})
         st.dataframe(dfm, use_container_width=True)
-        csv = dfm.to_csv(index=False).encode("utf-8")
-        st.download_button("Download median times (CSV)", csv, "median_stage_times.csv", "text/csv")
+        st.download_button("Download median times (CSV)", dfm.to_csv(index=False).encode("utf-8"), "median_stage_times.csv", "text/csv")
     else:
         st.info("Not enough sessions with both stages to compute median times.")
 
@@ -309,7 +341,7 @@ def dropoff_analytics(dff: pd.DataFrame):
     sess_info = dff.groupby("session").agg(first_ts=("timestamp", "min"), hour=("hour", "median"))
     top_products = dff.loc[dff["event_norm"] == "purchase"].groupby("product")["amount"].sum().sort_values(ascending=False).head(10).index.tolist()
     dff["product_bucket"] = np.where(dff["product"].isin(top_products), dff["product"], "Other")
-    prod_mode = dff.groupby("session")["product_bucket"].agg(lambda x: x.mode().iat[0] if len(x.mode())>0 else "Other")
+    prod_mode = dff.groupby("session")["product_bucket"].agg(lambda x: x.mode().iat[0] if len(x.mode()) > 0 else "Other")
     sreach = sreach.join(sess_info).join(prod_mode.rename("product_bucket"))
     agg = sreach.groupby(["last_stage", "hour", "product_bucket"]).size().reset_index(name="sessions")
     if agg.empty:
@@ -320,8 +352,7 @@ def dropoff_analytics(dff: pd.DataFrame):
     st.plotly_chart(fig, use_container_width=True)
     stuck = sreach[sreach["last_stage"].isin(["view", "add_to_cart", "checkout"])].copy()
     st.dataframe(stuck[["session", "last_stage", "hour", "product_bucket"]].head(1000), use_container_width=True)
-    csv = stuck[["session", "last_stage", "hour", "product_bucket"]].to_csv(index=False).encode("utf-8")
-    st.download_button("Download stuck sessions (CSV)", csv, "stuck_sessions.csv", "text/csv")
+    st.download_button("Download stuck sessions (CSV)", stuck[["session", "last_stage", "hour", "product_bucket"]].to_csv(index=False).encode("utf-8"), "stuck_sessions.csv", "text/csv")
 
 def leakage_cohort(dff: pd.DataFrame):
     sess_first = dff.sort_values(["session", "timestamp"]).groupby("session").first().reset_index()
@@ -330,8 +361,7 @@ def leakage_cohort(dff: pd.DataFrame):
         st.info("No leakage cohort data available.")
         return
     st.dataframe(tbl, use_container_width=True)
-    csv = tbl.to_csv(index=False).encode("utf-8")
-    st.download_button("Download leakage cohort (CSV)", csv, "leakage_cohort.csv", "text/csv")
+    st.download_button("Download leakage cohort (CSV)", tbl.to_csv(index=False).encode("utf-8"), "leakage_cohort.csv", "text/csv")
 
 # ------------------------------
 # Cohorts & Retention
@@ -389,8 +419,7 @@ def cohorts_tab(df: pd.DataFrame, start: date, end: date):
     clv = purch_with_cohort.groupby(["cohort", "offset"])["amount"].sum().reset_index()
     clv["cum_rev"] = clv.groupby("cohort")["amount"].cumsum()
     st.dataframe(clv.pivot(index="cohort", columns="offset", values="cum_rev").fillna(0), use_container_width=True)
-    csv = clv.to_csv(index=False).encode("utf-8")
-    st.download_button("Download cohort CLV table (CSV)", csv, "cohort_clv.csv", "text/csv")
+    st.download_button("Download cohort CLV table (CSV)", clv.to_csv(index=False).encode("utf-8"), "cohort_clv.csv", "text/csv")
 
 # ------------------------------
 # RFM Segmentation
@@ -432,8 +461,7 @@ def rfm_segmentation(df: pd.DataFrame, start: date, end: date):
     seg["user_share"] = seg["users"] / seg["users"].sum()
     seg["rev_share"] = seg["revenue"] / seg["revenue"].sum()
     st.dataframe(seg.sort_values("rev_share", ascending=False), use_container_width=True)
-    csv = seg.to_csv(index=False).encode("utf-8")
-    st.download_button("Download segment mix (CSV)", csv, "rfm_segment_mix.csv", "text/csv")
+    st.download_button("Download segment mix (CSV)", seg.to_csv(index=False).encode("utf-8"), "rfm_segment_mix.csv", "text/csv")
     aov = purch.groupby("user")["amount"].sum().mean()
     rep = purch.groupby("user").size()
     repeat_rate = (rep >= 2).sum() / rep.shape[0] if rep.shape[0] > 0 else 0.0
@@ -459,16 +487,14 @@ def product_performance(df: pd.DataFrame, start: date, end: date):
         st.info("No purchases in selected range.")
         return
     top = purch.groupby("product")["amount"].sum().reset_index().sort_values("amount", ascending=False)
-    top["rank"] = np.arange(1, len(top)+1)
+    top["rank"] = np.arange(1, len(top) + 1)
     top["cum_share"] = top["amount"].cumsum() / top["amount"].sum()
     st.dataframe(top.head(50), use_container_width=True)
     st.download_button("Download top products (CSV)", top.to_csv(index=False).encode("utf-8"), "top_products.csv", "text/csv")
-    fig_r = px.bar(top.head(20), x="product", y="amount", title="Top Products by Revenue")
-    fig_r.update_layout(xaxis_title="Product", yaxis_title="Revenue")
-    st.plotly_chart(fig_r, use_container_width=True)
-    fig_p = px.line(top, x="rank", y="cum_share", title="Pareto Curve (Cumulative Revenue Share)")
-    fig_p.add_hline(y=0.8, line_dash="dash")
-    st.plotly_chart(fig_p, use_container_width=True)
+    st.plotly_chart(px.bar(top.head(20), x="product", y="amount", title="Top Products by Revenue").update_layout(xaxis_title="Product", yaxis_title="Revenue"), use_container_width=True)
+    pareto = px.line(top, x="rank", y="cum_share", title="Pareto Curve (Cumulative Revenue Share)")
+    pareto.add_hline(y=0.8, line_dash="dash")
+    st.plotly_chart(pareto, use_container_width=True)
     days = max(1, (pd.to_datetime(end) - pd.to_datetime(start)).days + 1)
     velocity = purch.groupby("product").size().rename("purchases").reset_index()
     velocity["per_day"] = velocity["purchases"] / days
@@ -481,14 +507,14 @@ def product_performance(df: pd.DataFrame, start: date, end: date):
     pair_counts = {}
     for plist in sess_views:
         for i in range(len(plist)):
-            for j in range(i+1, len(plist)):
+            for j in range(i + 1, len(plist)):
                 a, b = sorted([plist[i], plist[j]])
                 pair_counts[(a, b)] = pair_counts.get((a, b), 0) + 1
     copurch = purch.groupby("session")["product"].apply(lambda x: list(pd.unique(x.dropna())))
     copair = set()
     for plist in copurch:
         for i in range(len(plist)):
-            for j in range(i+1, len(plist)):
+            for j in range(i + 1, len(plist)):
                 a, b = sorted([plist[i], plist[j]])
                 copair.add((a, b))
     rows = []
@@ -519,16 +545,14 @@ def session_analytics(df: pd.DataFrame, start: date, end: date):
     sess = sess.join(rev, on="session").fillna({"revenue": 0.0})
     bounce = int(((sess["events"] == 1) & (sess["revenue"] == 0)).sum())
     st.caption(f"Bounce proxy (single-event sessions without purchase): {bounce:,}")
-    fig1 = px.histogram(sess, x="duration_min", nbins=50, title="Session Duration (minutes)")
-    st.plotly_chart(fig1, use_container_width=True)
-    fig2 = px.histogram(sess, x="events", nbins=50, title="Events per Session")
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(px.histogram(sess, x="duration_min", nbins=50, title="Session Duration (minutes)"), use_container_width=True)
+    st.plotly_chart(px.histogram(sess, x="events", nbins=50, title="Events per Session"), use_container_width=True)
     flows = dff.sort_values(["session", "timestamp"]).groupby("session")["event_norm"].apply(list)
     edges = {}
     for seq in flows:
         if "purchase" in seq:
-            for i in range(len(seq)-1):
-                a, b = seq[i], seq[i+1]
+            for i in range(len(seq) - 1):
+                a, b = seq[i], seq[i + 1]
                 edges[(a, b)] = edges.get((a, b), 0) + 1
     if edges:
         top_edges = sorted(edges.items(), key=lambda kv: kv[1], reverse=True)[:12]
@@ -539,10 +563,7 @@ def session_analytics(df: pd.DataFrame, start: date, end: date):
             target=[idx[e[0][1]] for e in top_edges],
             value=[e[1] for e in top_edges]
         )
-        sankey = go.Figure(data=[go.Sankey(
-            node=dict(label=nodes, pad=15, thickness=20),
-            link=link
-        )])
+        sankey = go.Figure(data=[go.Sankey(node=dict(label=nodes, pad=15, thickness=20), link=link)])
         sankey.update_layout(title_text="Top Event Flows (ending in purchase)", font_size=12)
         st.plotly_chart(sankey, use_container_width=True)
     st.dataframe(sess.head(1000), use_container_width=True)
@@ -573,7 +594,7 @@ def clv_and_risk(df: pd.DataFrame, start: date, end: date):
     for u in users:
         m_spend = float(monthly_spend.get(u, recent_purch["amount"].mean() if not recent_purch.empty else 0.0))
         clv = 0.0
-        for m in range(1, horizon+1):
+        for m in range(1, horizon + 1):
             disc = (1 + monthly_disc) ** m
             clv += (m_spend * (retention ** m)) / disc
         rows.append({"user": u, "est_monthly_spend": m_spend, "est_retention": retention, f"CLV_{horizon}m": clv})
@@ -610,7 +631,7 @@ def clv_and_risk(df: pd.DataFrame, start: date, end: date):
     st.download_button("Download prioritized retention list (CSV)", out.to_csv(index=False).encode("utf-8"), "retention_list.csv", "text/csv")
 
 # ------------------------------
-# Executive Overview Tab
+# Executive Overview
 # ------------------------------
 def executive_overview(df: pd.DataFrame, start: date, end: date, full_df: pd.DataFrame):
     k = compute_kpis(df, start, end, full_df)
@@ -631,62 +652,115 @@ def executive_overview(df: pd.DataFrame, start: date, end: date, full_df: pd.Dat
     new_vs_returning(df, start, end)
 
 # ------------------------------
-# Sidebar — File, Sheet, Date Filter
+# Sidebar Inputs & Data Loading
 # ------------------------------
 st.title("E-commerce Growth Command Center")
 
-definitions_ui()
+st.sidebar.markdown("### Data Source")
+gh_url = st.sidebar.text_input("GitHub/HTTP raw URL (.xlsx or .csv)", value="", help="Paste the raw file URL. CSV requires no extra packages; XLSX requires 'openpyxl'.")
+uploaded = st.sidebar.file_uploader("Or upload file (.xlsx or .csv)", type=["xlsx", "csv"])
 
-uploaded = st.sidebar.file_uploader("Upload Excel workbook (.xlsx)", type=["xlsx"])
-
-sheet_name = None
 df_loaded = None
-min_date = None
-max_date = None
-column_map = None
+sheet_name = None
 
-DEFAULT_SHEET = "ecommerce_clickstream_transacti"
-
-if uploaded is not None:
+# 1) URL path
+if gh_url.strip():
     try:
-        xls = pd.ExcelFile(uploaded)
+        raw = _http_get(gh_url.strip())
+        if gh_url.strip().lower().endswith(".csv"):
+            df_loaded = _read_csv_bytes(raw)
+            sheet_name = None
+        else:
+            # Try Excel
+            # Build sheet selector from workbook if possible; otherwise fall back to default first sheet.
+            try:
+                import openpyxl  # noqa: F401
+            except Exception as e:
+                st.error("Reading .xlsx requires `openpyxl`. Install with: `pip install openpyxl` "
+                         "or supply a CSV URL instead.")
+                st.stop()
+            # Probe sheets
+            xls = pd.ExcelFile(io.BytesIO(raw))
+            sheets = xls.sheet_names
+            default_idx = sheets.index(DEFAULT_SHEET) if DEFAULT_SHEET in sheets else 0
+            sheet_name = st.sidebar.selectbox("Sheet", sheets, index=default_idx, key="sheet_url")
+            df_loaded = _read_excel_bytes(raw, sheet_name)
+    except Exception as e:
+        st.error(f"Failed to load from URL: {e}")
+        st.stop()
+
+# 2) Local default file
+elif os.path.exists(DEFAULT_LOCAL_XLSX):
+    try:
+        # Probe sheets
+        try:
+            import openpyxl  # noqa: F401
+        except Exception as e:
+            st.error("Local .xlsx found but `openpyxl` is missing. Install with: `pip install openpyxl`, "
+                     "or save/export the file as CSV and reload via URL/Uploader.")
+            st.stop()
+        xls = pd.ExcelFile(DEFAULT_LOCAL_XLSX)
         sheets = xls.sheet_names
         default_idx = sheets.index(DEFAULT_SHEET) if DEFAULT_SHEET in sheets else 0
-        sheet_name = st.sidebar.selectbox("Sheet", sheets, index=default_idx)
-        df_loaded = load_excel(uploaded.getvalue(), sheet_name)
-        auto_map = auto_map_columns(df_loaded)
-        with st.sidebar.expander("Column Mapping", expanded=False):
-            use_manual = st.checkbox("Adjust mappings", value=False)
-            if use_manual:
-                auto_map = column_mapping_helper(df_loaded, auto_map)
-        try:
-            df, meta, min_dt, max_dt = preprocess(df_loaded, auto_map)
-            column_map = auto_map
-            min_date = min_dt.date()
-            max_date = max_dt.date()
-        except ValueError as e:
-            st.error(str(e))
-            st.stop()
+        sheet_name = st.sidebar.selectbox("Sheet", sheets, index=default_idx, key="sheet_local")
+        with open(DEFAULT_LOCAL_XLSX, "rb") as f:
+            df_loaded = _read_excel_bytes(f.read(), sheet_name)
     except Exception as e:
-        st.error(f"Failed to read Excel file: {e}")
+        st.error(f"Failed to read local file '{DEFAULT_LOCAL_XLSX}': {e}")
+        st.stop()
+
+# 3) Streamlit uploader
+elif uploaded is not None:
+    try:
+        raw = uploaded.getvalue()
+        if uploaded.name.lower().endswith(".csv"):
+            df_loaded = _read_csv_bytes(raw)
+            sheet_name = None
+        else:
+            try:
+                import openpyxl  # noqa: F401
+            except Exception:
+                st.error("Reading .xlsx requires `openpyxl`. Install with: `pip install openpyxl`, "
+                         "or upload CSV instead.")
+                st.stop()
+            xls = pd.ExcelFile(io.BytesIO(raw))
+            sheets = xls.sheet_names
+            default_idx = sheets.index(DEFAULT_SHEET) if DEFAULT_SHEET in sheets else 0
+            sheet_name = st.sidebar.selectbox("Sheet", sheets, index=default_idx, key="sheet_upload")
+            df_loaded = _read_excel_bytes(raw, sheet_name)
+    except Exception as e:
+        st.error(f"Failed to read uploaded file: {e}")
         st.stop()
 else:
-    st.info("Upload an Excel workbook (.xlsx) in the left sidebar to begin.")
+    st.info("Provide a GitHub/HTTP URL, or place 'ecommerce_clickstream_transactions.xlsx' in project root, or upload a file.")
     st.stop()
 
-if min_date and max_date:
-    start_date, end_date = st.sidebar.date_input(
-        "Date range",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date
-    )
-    if isinstance(start_date, (list, tuple)):
-        start_date, end_date = start_date[0], start_date[1]
-else:
-    st.error("Could not determine date range.")
+# Column mapping & preprocess
+auto_map = auto_map_columns(df_loaded)
+with st.sidebar.expander("Column Mapping", expanded=False):
+    if st.checkbox("Adjust mappings", value=False):
+        auto_map = column_mapping_helper(df_loaded, auto_map)
+
+try:
+    df, meta, min_dt, max_dt = preprocess(df_loaded, auto_map)
+    min_date, max_date = min_dt.date(), max_dt.date()
+except ValueError as e:
+    st.error(str(e))
     st.stop()
 
+# Date range
+start_date, end_date = st.sidebar.date_input(
+    "Date range",
+    value=(min_date, max_date),
+    min_value=min_date,
+    max_value=max_date
+)
+if isinstance(start_date, (list, tuple)):
+    start_date, end_date = start_date[0], start_date[1]
+
+# ------------------------------
+# Tabs
+# ------------------------------
 tabs = st.tabs([
     "Executive Overview",
     "Funnel & Drop-off",
